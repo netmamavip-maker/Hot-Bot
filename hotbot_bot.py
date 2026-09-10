@@ -78,6 +78,21 @@ GEMINI_PROVIDER = {
     "image_model": os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image"),
 }
 
+# --- Backup / community text-to-image provider (generation only, no editing)
+# Third-party community project on Cloudflare Workers AI. No account, no key.
+# Independent of Gemini — used as a fallback / secondary "free" generator.
+# SAFETY IS ALWAYS FORCED ON below (see backup_image_generate) and is never
+# exposed as a togglable option anywhere in this bot.
+# Set BACKUP_IMAGE_ENABLED=false to turn this feature off entirely.
+BACKUP_IMAGE_PROVIDER = {
+    "name": "ashlynn-community",
+    "enabled": os.environ.get("BACKUP_IMAGE_ENABLED", "true").lower() == "true",
+    "base_url": os.environ.get(
+        "BACKUP_IMAGE_BASE_URL", "https://death-image.ashlynn.workers.dev"
+    ),
+    "steps": int(os.environ.get("BACKUP_IMAGE_STEPS", "8")),
+}
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MEMORY_FILE = os.path.join(BASE_DIR, "bot_memory.json")
 MEMORY_MAX_MESSAGES = int(os.environ.get("MEMORY_MAX_MESSAGES", "60"))
@@ -291,6 +306,114 @@ async def gemini_image_generate(
         )
 
 
+async def backup_image_generate(prompt: str, dimensions: str = "1:1") -> str:
+    """Community/free text-to-image backup (generation only — cannot edit an
+    existing photo). Returns a hosted image URL. SAFETY IS ALWAYS FORCED TRUE
+    here — this is intentional and must never be made configurable."""
+    cfg = BACKUP_IMAGE_PROVIDER
+    if not cfg["enabled"]:
+        raise ProviderError("Backup image provider is disabled.")
+    url = f"{cfg['base_url'].rstrip('/')}/generate"
+    params = {
+        "prompt": prompt,
+        "image": 1,
+        "dimensions": dimensions,
+        "safety": "true",  # hardcoded — never read from config or user input
+        "steps": cfg["steps"],
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.get(url, params=params)
+    if resp.status_code >= 400:
+        raise ProviderError(f"Backup image provider error {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    images = data.get("images") or []
+    if not images:
+        raise ProviderError(f"Backup provider returned no images: {json.dumps(data)[:200]}")
+    return images[0]
+
+
+# ============================================================================
+# Preset prompt gallery — pick a ready-made edit style instead of typing one
+# (same idea as meigen.ai's prompt cards; runs on our own Gemini pipeline)
+# ============================================================================
+
+PRESET_PROMPTS: list[dict[str, str]] = [
+    {
+        "id": "product_bg",
+        "label": "📦 প্রোডাক্ট শোকেস",
+        "prompt": "Place the main product on a clean white studio background with a soft realistic shadow, professional product photography lighting, high detail.",
+    },
+    {
+        "id": "cinematic",
+        "label": "🎬 সিনেমাটিক পোর্ট্রেট",
+        "prompt": "Transform this photo into a cinematic portrait with dramatic lighting, shallow depth of field, and a moody film color grade.",
+    },
+    {
+        "id": "anime",
+        "label": "🌸 অ্যানিমে স্টাইল",
+        "prompt": "Convert this photo into a vibrant Japanese anime illustration: clean line art, cel-shaded coloring, expressive style.",
+    },
+    {
+        "id": "ghibli",
+        "label": "🎨 ঘিবলি স্টাইল",
+        "prompt": "Reimagine this image in a hand-painted Studio-Ghibli-inspired animation style: soft pastel colors, whimsical, painterly backgrounds.",
+    },
+    {
+        "id": "3d_render",
+        "label": "🧊 থ্রিডি রেন্ডার",
+        "prompt": "Turn this into a polished 3D rendered illustration with Pixar-style character design and soft global illumination.",
+    },
+    {
+        "id": "remove_bg",
+        "label": "✂️ ব্যাকগ্রাউন্ড রিমুভ",
+        "prompt": "Remove the background completely, keeping only the main subject sharply cut out on a plain transparent/white background.",
+    },
+    {
+        "id": "vintage_poster",
+        "label": "🖼️ ভিন্টেজ পোস্টার",
+        "prompt": "Redesign this as a vintage travel poster illustration: bold flat colors, retro typography feel, 1950s aesthetic.",
+    },
+    {
+        "id": "cyberpunk",
+        "label": "🌃 নিয়ন সাইবারপাঙ্ক",
+        "prompt": "Restyle this image with a cyberpunk aesthetic: neon lights, futuristic city glow, high-contrast saturated colors.",
+    },
+    {
+        "id": "logo_mockup",
+        "label": "🏷️ লোগো মকআপ",
+        "prompt": "Place this logo/design onto a realistic professional mockup such as a business card, storefront sign, or product packaging.",
+    },
+    {
+        "id": "golden_hour",
+        "label": "🌅 গোল্ডেন আওয়ার লাইটিং",
+        "prompt": "Relight this photo as if taken during golden hour sunset: warm tones, soft glowing light, long soft shadows.",
+    },
+    {
+        "id": "watercolor",
+        "label": "🎨 ওয়াটারকালার পেইন্টিং",
+        "prompt": "Convert this photo into a delicate watercolor painting: soft bleeding edges, visible paper texture, artistic color washes.",
+    },
+    {
+        "id": "wallpaper_hd",
+        "label": "🖥️ ওয়ালপেপার এইচডি",
+        "prompt": "Enhance and reimagine this as a high-detail desktop wallpaper: ultra sharp, vivid colors, epic wide composition.",
+    },
+]
+
+PRESET_BY_ID = {p["id"]: p for p in PRESET_PROMPTS}
+
+
+def presets_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(PRESET_PROMPTS), 2):
+        pair = PRESET_PROMPTS[i : i + 2]
+        rows.append(
+            [InlineKeyboardButton(p["label"], callback_data=f"preset:{p['id']}") for p in pair]
+        )
+    rows.append([InlineKeyboardButton("🔙 Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
+
+
 # ============================================================================
 # UI
 # ============================================================================
@@ -304,7 +427,10 @@ def main_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🖼️ Image", callback_data="image"),
             ],
             [
+                InlineKeyboardButton("🎨 Presets", callback_data="presets"),
                 InlineKeyboardButton("🧠 Memory", callback_data="memory"),
+            ],
+            [
                 InlineKeyboardButton("ℹ️ Help", callback_data="help"),
             ],
         ]
@@ -331,6 +457,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "💬 *Chat* — text conversation (Grok)\n"
         "👁️ *Vision* — send a photo + a question, I'll look at it (Gemini)\n"
         "🖼️ *Image* — generate a new image, or send a photo + edit instructions (Gemini)\n"
+        "🎨 *Presets* — pick a ready-made edit style, then send your photo\n"
         "🧠 *Memory* — remembers your chat history until you clear it\n\n"
         "Tap a button below, or use `/ask`, `/img`, `/memory`, `/clear`.",
         parse_mode=ParseMode.MARKDOWN,
@@ -343,6 +470,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*ℹ️ Help*\n\n"
         "• `/ask <question>` — quick chat\n"
         "• `/img <prompt>` — quick image generation\n"
+        "• `/img2 <prompt>` — backup generator (free community service)\n"
         "• send a photo — I'll ask what you want to know / do with it\n"
         "• `/memory` — see memory status, `/memory on` / `/memory off`\n"
         "• `/clear` — wipe your saved history\n"
@@ -366,6 +494,25 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/img your prompt`", parse_mode=ParseMode.MARKDOWN)
         return
     await run_image(update, ctx, parts[1].strip(), image_b64=None)
+
+
+async def cmd_img2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Generation-only, via the free community backup provider (safety forced on)."""
+    parts = (update.message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage: `/img2 your prompt`", parse_mode=ParseMode.MARKDOWN)
+        return
+    prompt = parts[1].strip()
+    status = await update.message.reply_text("🆓 Generating (community backup)…")
+    try:
+        image_url = await backup_image_generate(prompt)
+        await status.delete()
+        await update.message.reply_photo(photo=image_url, caption=f"🆓 {prompt[:900]}", reply_markup=main_kb())
+    except ProviderError as e:
+        await status.edit_text(f"⚠️ {e}")
+    except Exception as e:
+        log.exception("backup image failed")
+        await status.edit_text(f"❌ Error: {e}")
 
 
 async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -435,6 +582,32 @@ async def cb_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return S_INPUT
 
 
+async def cb_presets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🎨 *Preset Styles*\nএকটা স্টাইল বেছে নিন, তারপর যে ছবিটা এডিট করতে চান সেটা পাঠান।",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=presets_kb(),
+    )
+
+
+async def cb_preset_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    preset_id = q.data.split(":", 1)[1]
+    preset = PRESET_BY_ID.get(preset_id)
+    if not preset:
+        await q.edit_message_text("⚠️ Preset not found.", reply_markup=main_kb())
+        return
+    ctx.user_data["preset_prompt"] = preset["prompt"]
+    ctx.user_data["waiting_for"] = "preset_awaiting_photo"
+    await q.edit_message_text(
+        f"🎨 *{preset['label']}* সিলেক্ট করা হয়েছে।\n\n📸 এখন যে ছবিটাতে এই স্টাইল অ্যাপ্লাই করতে চান, সেটা পাঠান।\n\n`/cancel` to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ============================================================================
 # Chat flow
 # ============================================================================
@@ -472,8 +645,17 @@ async def run_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
 
 
 async def photo_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Any photo the user sends: store it, ask what they want done with it."""
+    """Any photo the user sends: apply a pending preset if one was chosen,
+    otherwise store it and ask what they want done with it."""
     b64, mime = await telegram_photo_to_b64(update)
+
+    if ctx.user_data.get("waiting_for") == "preset_awaiting_photo":
+        prompt = ctx.user_data.pop("preset_prompt", None)
+        ctx.user_data.pop("waiting_for", None)
+        if prompt:
+            await run_image(update, ctx, prompt, image_b64=b64, image_mime=mime)
+            return ConversationHandler.END
+
     ctx.user_data["pending_image_b64"] = b64
     ctx.user_data["pending_image_mime"] = mime
     ctx.user_data["waiting_for"] = "photo_followup"
@@ -618,6 +800,7 @@ async def post_init(app: Application):
             ("start", "🧿 Main menu"),
             ("ask", "💬 Quick chat — /ask <question>"),
             ("img", "🖼️ Quick image — /img <prompt>"),
+            ("img2", "🆓 Backup image — /img2 <prompt>"),
             ("memory", "🧠 Memory status / on / off"),
             ("clear", "🧹 Clear my memory"),
             ("help", "ℹ️ Help"),
@@ -648,6 +831,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("img", cmd_img))
+    app.add_handler(CommandHandler("img2", cmd_img2))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(conv)
@@ -661,6 +845,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help$"))
     app.add_handler(CallbackQueryHandler(cb_memory, pattern=r"^memory$"))
+    app.add_handler(CallbackQueryHandler(cb_presets, pattern=r"^presets$"))
+    app.add_handler(CallbackQueryHandler(cb_preset_pick, pattern=r"^preset:"))
 
     app.add_error_handler(error_handler)
     return app
