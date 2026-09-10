@@ -3,7 +3,7 @@
 hotbot_bot.py — Telegram AI bot using OFFICIAL provider APIs.
 
 Providers used right now:
-  💬 Chat            -> Grok (xAI), OpenAI-compatible /chat/completions
+  💬 Chat            -> Groq (console.groq.com), OpenAI-compatible /chat/completions
   👁️ Vision           -> Gemini (Google), generateContent (multimodal)
   🖼️ Image generate/edit -> Gemini (Google), image-capable model
 
@@ -18,7 +18,7 @@ Nothing is hardcoded in this file.
 
 Required environment variables:
   TELEGRAM_BOT_TOKEN   - from @BotFather
-  XAI_API_KEY          - xAI (Grok) API key
+  GROQ_API_KEY         - Groq (console.groq.com) API key
   GEMINI_API_KEY       - Google AI Studio (Gemini) API key
 
 Run:
@@ -56,16 +56,15 @@ from telegram.ext import (
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]  # required, no default
 
-# --- Chat provider (currently Grok / xAI, OpenAI-compatible chat API) -----
+# --- Chat provider (Groq — console.groq.com, OpenAI-compatible chat API) --
 CHAT_PROVIDER = {
-    "name": "grok",
-    "api_key": os.environ.get("XAI_API_KEY", ""),
-    "base_url": os.environ.get("CHAT_BASE_URL", "https://api.x.ai/v1"),
-    "model": os.environ.get("CHAT_MODEL", "grok-4"),
+    "name": "groq",
+    "api_key": os.environ.get("GROQ_API_KEY", ""),
+    "base_url": os.environ.get("CHAT_BASE_URL", "https://api.groq.com/openai/v1"),
+    "model": os.environ.get("CHAT_MODEL", "openai/gpt-oss-120b"),
 }
-# To switch chat to a different OpenAI-compatible provider later (OpenAI,
-# Anthropic-via-compatible-gateway, etc.) just change api_key / base_url /
-# model above (and the header format in _call_chat if it isn't OpenAI-style).
+# To switch chat to a different OpenAI-compatible provider later, just change
+# api_key / base_url / model above — _call_chat() below doesn't need to change.
 
 # --- Vision + Image provider (currently Gemini / Google) ------------------
 GEMINI_PROVIDER = {
@@ -75,7 +74,41 @@ GEMINI_PROVIDER = {
         "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"
     ),
     "vision_model": os.environ.get("GEMINI_VISION_MODEL", "gemini-2.5-flash"),
-    "image_model": os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image"),
+}
+# NOTE: Gemini is used for VISION (asking questions about a photo) only now.
+# gemini-2.5-flash-image effectively has no usable free-tier quota (Google
+# requires billing enabled for it), so image generation/editing has been
+# moved to Cloudflare Workers AI below, which has a real, working free tier
+# (Stable Diffusion XL supports image-to-image editing, not just generation).
+
+# --- Image generate + edit provider (Cloudflare Workers AI, free tier) ----
+# No Worker needs to be deployed — we call Cloudflare's REST API directly.
+# You need two values from dash.cloudflare.com:
+#   1) Account ID           -> right sidebar of any Workers & Pages page
+#   2) API Token            -> My Profile -> API Tokens -> Create Token
+#                              -> template "Workers AI" (or custom with
+#                              "Workers AI: Edit" permission)
+CLOUDFLARE_PROVIDER = {
+    "account_id": os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
+    "api_token": os.environ.get("CLOUDFLARE_API_TOKEN", ""),
+    "model": os.environ.get(
+        "CLOUDFLARE_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0"
+    ),
+}
+
+# --- Backup / community text-to-image provider (generation only, no editing)
+# Third-party community project on Cloudflare Workers AI. No account, no key.
+# Independent of Gemini — used as a fallback / secondary "free" generator.
+# SAFETY IS ALWAYS FORCED ON below (see backup_image_generate) and is never
+# exposed as a togglable option anywhere in this bot.
+# Set BACKUP_IMAGE_ENABLED=false to turn this feature off entirely.
+BACKUP_IMAGE_PROVIDER = {
+    "name": "ashlynn-community",
+    "enabled": os.environ.get("BACKUP_IMAGE_ENABLED", "true").lower() == "true",
+    "base_url": os.environ.get(
+        "BACKUP_IMAGE_BASE_URL", "https://death-image.ashlynn.workers.dev"
+    ),
+    "steps": int(os.environ.get("BACKUP_IMAGE_STEPS", "8")),
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -197,7 +230,7 @@ async def telegram_photo_to_b64(update: Update) -> tuple[str, str]:
 
 
 # ============================================================================
-# Chat provider adapter (Grok / xAI — OpenAI-compatible)
+# Chat provider adapter (Groq — OpenAI-compatible)
 # ============================================================================
 
 
@@ -205,7 +238,7 @@ async def _call_chat(messages: list[dict[str, str]]) -> str:
     cfg = CHAT_PROVIDER
     if not cfg["api_key"]:
         raise ProviderError(
-            "Chat provider API key is missing. Set the XAI_API_KEY secret."
+            "Chat provider API key is missing. Set the GROQ_API_KEY secret."
         )
     url = f"{cfg['base_url'].rstrip('/')}/chat/completions"
     headers = {
@@ -270,25 +303,155 @@ async def gemini_vision_answer(text_prompt: str, image_b64: str, image_mime: str
         raise ProviderError(f"Unexpected Gemini vision response: {json.dumps(data)[:300]}")
 
 
-async def gemini_image_generate(
-    prompt: str, image_b64: Optional[str] = None, image_mime: str = "image/jpeg"
+async def cf_image_generate(
+    prompt: str, image_bytes: Optional[bytes] = None, strength: float = 0.75
 ) -> bytes:
-    """Generate a new image, or edit `image_b64` if provided, via Gemini's
-    image-capable model. Returns raw image bytes."""
-    data = await _gemini_generate(
-        GEMINI_PROVIDER["image_model"], prompt, image_b64, image_mime
-    )
-    try:
-        parts = data["candidates"][0]["content"]["parts"]
-        for p in parts:
-            inline = p.get("inline_data") or p.get("inlineData")
-            if inline and inline.get("data"):
-                return base64.b64decode(inline["data"])
-        raise KeyError
-    except (KeyError, IndexError, TypeError):
+    """Generate a new image, or edit `image_bytes` if provided, via Cloudflare
+    Workers AI (Stable Diffusion XL — supports real image-to-image editing on
+    the free tier, not just text-to-image). Returns raw PNG/JPEG bytes."""
+    cfg = CLOUDFLARE_PROVIDER
+    if not cfg["account_id"] or not cfg["api_token"]:
         raise ProviderError(
-            f"Gemini returned no image data: {json.dumps(data)[:300]}"
+            "Cloudflare image provider isn't configured. Set CLOUDFLARE_ACCOUNT_ID "
+            "and CLOUDFLARE_API_TOKEN secrets."
         )
+    url = (
+        f"https://api.cloudflare.com/client/v4/accounts/{cfg['account_id']}"
+        f"/ai/run/{cfg['model']}"
+    )
+    headers = {
+        "Authorization": f"Bearer {cfg['api_token']}",
+        "Content-Type": "application/json",
+    }
+    body: dict[str, Any] = {"prompt": prompt}
+    if image_bytes:
+        body["image"] = list(image_bytes)
+        body["strength"] = strength
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(url, headers=headers, json=body)
+    if resp.status_code >= 400:
+        raise ProviderError(f"Cloudflare image error {resp.status_code}: {resp.text[:300]}")
+    content_type = resp.headers.get("content-type", "")
+    if content_type.startswith("image/"):
+        return resp.content
+    # Some Workers AI responses wrap a base64 image in JSON instead of
+    # returning raw bytes directly — handle both shapes.
+    try:
+        data = resp.json()
+        b64 = data.get("result", {}).get("image") or data.get("image")
+        if b64:
+            return base64.b64decode(b64)
+        raise KeyError
+    except (KeyError, ValueError, AttributeError):
+        raise ProviderError(f"Unexpected Cloudflare image response: {resp.text[:300]}")
+
+
+async def backup_image_generate(prompt: str, dimensions: str = "1:1") -> str:
+    """Community/free text-to-image backup (generation only — cannot edit an
+    existing photo). Returns a hosted image URL. SAFETY IS ALWAYS FORCED TRUE
+    here — this is intentional and must never be made configurable."""
+    cfg = BACKUP_IMAGE_PROVIDER
+    if not cfg["enabled"]:
+        raise ProviderError("Backup image provider is disabled.")
+    url = f"{cfg['base_url'].rstrip('/')}/generate"
+    params = {
+        "prompt": prompt,
+        "image": 1,
+        "dimensions": dimensions,
+        "safety": "true",  # hardcoded — never read from config or user input
+        "steps": cfg["steps"],
+    }
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.get(url, params=params)
+    if resp.status_code >= 400:
+        raise ProviderError(f"Backup image provider error {resp.status_code}: {resp.text[:200]}")
+    data = resp.json()
+    images = data.get("images") or []
+    if not images:
+        raise ProviderError(f"Backup provider returned no images: {json.dumps(data)[:200]}")
+    return images[0]
+
+
+# ============================================================================
+# Preset prompt gallery — pick a ready-made edit style instead of typing one
+# (same idea as meigen.ai's prompt cards; runs on our own Gemini pipeline)
+# ============================================================================
+
+PRESET_PROMPTS: list[dict[str, str]] = [
+    {
+        "id": "product_bg",
+        "label": "📦 প্রোডাক্ট শোকেস",
+        "prompt": "Place the main product on a clean white studio background with a soft realistic shadow, professional product photography lighting, high detail.",
+    },
+    {
+        "id": "cinematic",
+        "label": "🎬 সিনেমাটিক পোর্ট্রেট",
+        "prompt": "Transform this photo into a cinematic portrait with dramatic lighting, shallow depth of field, and a moody film color grade.",
+    },
+    {
+        "id": "anime",
+        "label": "🌸 অ্যানিমে স্টাইল",
+        "prompt": "Convert this photo into a vibrant Japanese anime illustration: clean line art, cel-shaded coloring, expressive style.",
+    },
+    {
+        "id": "ghibli",
+        "label": "🎨 ঘিবলি স্টাইল",
+        "prompt": "Reimagine this image in a hand-painted Studio-Ghibli-inspired animation style: soft pastel colors, whimsical, painterly backgrounds.",
+    },
+    {
+        "id": "3d_render",
+        "label": "🧊 থ্রিডি রেন্ডার",
+        "prompt": "Turn this into a polished 3D rendered illustration with Pixar-style character design and soft global illumination.",
+    },
+    {
+        "id": "remove_bg",
+        "label": "✂️ ব্যাকগ্রাউন্ড রিমুভ",
+        "prompt": "Remove the background completely, keeping only the main subject sharply cut out on a plain transparent/white background.",
+    },
+    {
+        "id": "vintage_poster",
+        "label": "🖼️ ভিন্টেজ পোস্টার",
+        "prompt": "Redesign this as a vintage travel poster illustration: bold flat colors, retro typography feel, 1950s aesthetic.",
+    },
+    {
+        "id": "cyberpunk",
+        "label": "🌃 নিয়ন সাইবারপাঙ্ক",
+        "prompt": "Restyle this image with a cyberpunk aesthetic: neon lights, futuristic city glow, high-contrast saturated colors.",
+    },
+    {
+        "id": "logo_mockup",
+        "label": "🏷️ লোগো মকআপ",
+        "prompt": "Place this logo/design onto a realistic professional mockup such as a business card, storefront sign, or product packaging.",
+    },
+    {
+        "id": "golden_hour",
+        "label": "🌅 গোল্ডেন আওয়ার লাইটিং",
+        "prompt": "Relight this photo as if taken during golden hour sunset: warm tones, soft glowing light, long soft shadows.",
+    },
+    {
+        "id": "watercolor",
+        "label": "🎨 ওয়াটারকালার পেইন্টিং",
+        "prompt": "Convert this photo into a delicate watercolor painting: soft bleeding edges, visible paper texture, artistic color washes.",
+    },
+    {
+        "id": "wallpaper_hd",
+        "label": "🖥️ ওয়ালপেপার এইচডি",
+        "prompt": "Enhance and reimagine this as a high-detail desktop wallpaper: ultra sharp, vivid colors, epic wide composition.",
+    },
+]
+
+PRESET_BY_ID = {p["id"]: p for p in PRESET_PROMPTS}
+
+
+def presets_kb() -> InlineKeyboardMarkup:
+    rows = []
+    for i in range(0, len(PRESET_PROMPTS), 2):
+        pair = PRESET_PROMPTS[i : i + 2]
+        rows.append(
+            [InlineKeyboardButton(p["label"], callback_data=f"preset:{p['id']}") for p in pair]
+        )
+    rows.append([InlineKeyboardButton("🔙 Menu", callback_data="menu")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================================
@@ -304,7 +467,10 @@ def main_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🖼️ Image", callback_data="image"),
             ],
             [
+                InlineKeyboardButton("🎨 Presets", callback_data="presets"),
                 InlineKeyboardButton("🧠 Memory", callback_data="memory"),
+            ],
+            [
                 InlineKeyboardButton("ℹ️ Help", callback_data="help"),
             ],
         ]
@@ -328,9 +494,10 @@ def done_kb(kind: str) -> InlineKeyboardMarkup:
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*🧿 AI Bot*\n\n"
-        "💬 *Chat* — text conversation (Grok)\n"
+        "💬 *Chat* — text conversation (Groq)\n"
         "👁️ *Vision* — send a photo + a question, I'll look at it (Gemini)\n"
         "🖼️ *Image* — generate a new image, or send a photo + edit instructions (Gemini)\n"
+        "🎨 *Presets* — pick a ready-made edit style, then send your photo\n"
         "🧠 *Memory* — remembers your chat history until you clear it\n\n"
         "Tap a button below, or use `/ask`, `/img`, `/memory`, `/clear`.",
         parse_mode=ParseMode.MARKDOWN,
@@ -343,6 +510,7 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*ℹ️ Help*\n\n"
         "• `/ask <question>` — quick chat\n"
         "• `/img <prompt>` — quick image generation\n"
+        "• `/img2 <prompt>` — backup generator (free community service)\n"
         "• send a photo — I'll ask what you want to know / do with it\n"
         "• `/memory` — see memory status, `/memory on` / `/memory off`\n"
         "• `/clear` — wipe your saved history\n"
@@ -366,6 +534,25 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/img your prompt`", parse_mode=ParseMode.MARKDOWN)
         return
     await run_image(update, ctx, parts[1].strip(), image_b64=None)
+
+
+async def cmd_img2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Generation-only, via the free community backup provider (safety forced on)."""
+    parts = (update.message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage: `/img2 your prompt`", parse_mode=ParseMode.MARKDOWN)
+        return
+    prompt = parts[1].strip()
+    status = await update.message.reply_text("🆓 Generating (community backup)…")
+    try:
+        image_url = await backup_image_generate(prompt)
+        await status.delete()
+        await update.message.reply_photo(photo=image_url, caption=f"🆓 {prompt[:900]}", reply_markup=main_kb())
+    except ProviderError as e:
+        await status.edit_text(f"⚠️ {e}")
+    except Exception as e:
+        log.exception("backup image failed")
+        await status.edit_text(f"❌ Error: {e}")
 
 
 async def cmd_memory(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -435,6 +622,32 @@ async def cb_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return S_INPUT
 
 
+async def cb_presets(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text(
+        "🎨 *Preset Styles*\nএকটা স্টাইল বেছে নিন, তারপর যে ছবিটা এডিট করতে চান সেটা পাঠান।",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=presets_kb(),
+    )
+
+
+async def cb_preset_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    preset_id = q.data.split(":", 1)[1]
+    preset = PRESET_BY_ID.get(preset_id)
+    if not preset:
+        await q.edit_message_text("⚠️ Preset not found.", reply_markup=main_kb())
+        return
+    ctx.user_data["preset_prompt"] = preset["prompt"]
+    ctx.user_data["waiting_for"] = "preset_awaiting_photo"
+    await q.edit_message_text(
+        f"🎨 *{preset['label']}* সিলেক্ট করা হয়েছে।\n\n📸 এখন যে ছবিটাতে এই স্টাইল অ্যাপ্লাই করতে চান, সেটা পাঠান।\n\n`/cancel` to abort.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ============================================================================
 # Chat flow
 # ============================================================================
@@ -472,8 +685,17 @@ async def run_chat(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str):
 
 
 async def photo_input(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Any photo the user sends: store it, ask what they want done with it."""
+    """Any photo the user sends: apply a pending preset if one was chosen,
+    otherwise store it and ask what they want done with it."""
     b64, mime = await telegram_photo_to_b64(update)
+
+    if ctx.user_data.get("waiting_for") == "preset_awaiting_photo":
+        prompt = ctx.user_data.pop("preset_prompt", None)
+        ctx.user_data.pop("waiting_for", None)
+        if prompt:
+            await run_image(update, ctx, prompt, image_b64=b64, image_mime=mime)
+            return ConversationHandler.END
+
     ctx.user_data["pending_image_b64"] = b64
     ctx.user_data["pending_image_mime"] = mime
     ctx.user_data["waiting_for"] = "photo_followup"
@@ -522,7 +744,8 @@ async def run_image(update: Update, ctx: ContextTypes.DEFAULT_TYPE, prompt: str,
     verb = "Editing" if image_b64 else "Generating"
     status = await update.message.reply_text(f"🖼️ {verb} image…")
     try:
-        image_bytes = await gemini_image_generate(prompt, image_b64, image_mime)
+        raw_bytes = base64.b64decode(image_b64) if image_b64 else None
+        image_bytes = await cf_image_generate(prompt, raw_bytes)
         await status.delete()
         await update.message.reply_photo(
             photo=image_bytes,
@@ -618,6 +841,7 @@ async def post_init(app: Application):
             ("start", "🧿 Main menu"),
             ("ask", "💬 Quick chat — /ask <question>"),
             ("img", "🖼️ Quick image — /img <prompt>"),
+            ("img2", "🆓 Backup image — /img2 <prompt>"),
             ("memory", "🧠 Memory status / on / off"),
             ("clear", "🧹 Clear my memory"),
             ("help", "ℹ️ Help"),
@@ -648,6 +872,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("img", cmd_img))
+    app.add_handler(CommandHandler("img2", cmd_img2))
     app.add_handler(CommandHandler("memory", cmd_memory))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(conv)
@@ -661,6 +886,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_menu, pattern=r"^menu$"))
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help$"))
     app.add_handler(CallbackQueryHandler(cb_memory, pattern=r"^memory$"))
+    app.add_handler(CallbackQueryHandler(cb_presets, pattern=r"^presets$"))
+    app.add_handler(CallbackQueryHandler(cb_preset_pick, pattern=r"^preset:"))
 
     app.add_error_handler(error_handler)
     return app
@@ -690,7 +917,7 @@ def start_health_server() -> None:
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("  AI Bot — Chat: Grok (xAI)  |  Vision/Image: Gemini")
+    print("  AI Bot — Chat: Groq  |  Vision/Image: Gemini")
     print("  Waiting for messages… (/start)")
     print("=" * 60)
     # Render's free tier only exists for "Web Service", which requires
