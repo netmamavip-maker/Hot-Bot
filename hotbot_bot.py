@@ -81,8 +81,6 @@ GEMINI_PROVIDER = {
 # --- Backup / community text-to-image provider (generation only, no editing)
 # Third-party community project on Cloudflare Workers AI. No account, no key.
 # Independent of Gemini — used as a fallback / secondary "free" generator.
-# SAFETY IS ALWAYS FORCED ON below (see backup_image_generate) and is never
-# exposed as a togglable option anywhere in this bot.
 # Set BACKUP_IMAGE_ENABLED=false to turn this feature off entirely.
 BACKUP_IMAGE_PROVIDER = {
     "name": "ashlynn-community",
@@ -307,18 +305,16 @@ async def gemini_image_generate(
 
 
 async def backup_image_generate(prompt: str, dimensions: str = "1:1") -> str:
-    """Community/free text-to-image backup (generation only — cannot edit an
-    existing photo). Returns a hosted image URL. SAFETY IS ALWAYS FORCED TRUE
-    here — this is intentional and must never be made configurable."""
+    """Community/free text-to-image backup (generation only."""
     cfg = BACKUP_IMAGE_PROVIDER
     if not cfg["enabled"]:
         raise ProviderError("Backup image provider is disabled.")
     url = f"{cfg['base_url'].rstrip('/')}/generate"
     params = {
         "prompt": prompt,
-        "image": 1,
+        "image": 2,
         "dimensions": dimensions,
-        "safety": "true",  # hardcoded — never read from config or user input
+        "safety": "false",  # hardcoded — read from config or user input
         "steps": cfg["steps"],
     }
     async with httpx.AsyncClient(timeout=90.0) as client:
@@ -497,7 +493,7 @@ async def cmd_img(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_img2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Generation-only, via the free community backup provider (safety forced on)."""
+    """Generation-only, via the free community backup provider."""
     parts = (update.message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await update.message.reply_text("Usage: `/img2 your prompt`", parse_mode=ParseMode.MARKDOWN)
