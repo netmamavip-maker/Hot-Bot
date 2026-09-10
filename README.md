@@ -5,9 +5,10 @@ A Telegram bot for chat, vision, and image generation/editing — built on
 
 | Feature | Provider |
 |---|---|
-| 💬 Chat | [xAI (Grok)](https://x.ai/api) |
+| 💬 Chat | [Groq](https://console.groq.com) |
 | 👁️ Vision (ask about a photo) | [Google Gemini](https://ai.google.dev) |
-| 🖼️ Image generate / edit | [Google Gemini](https://ai.google.dev) |
+| 🖼️ Image generate / edit | [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai) (free tier, Stable Diffusion XL — real image-to-image editing) |
+| 🆓 Backup image generate | Community Cloudflare-Workers-based service (generation only) |
 | 🧠 Memory | Local JSON, per-user, on/off toggle |
 
 ---
@@ -45,8 +46,10 @@ values to Git):
 | Variable | Where to get it |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather) on Telegram |
-| `XAI_API_KEY` | [console.x.ai](https://console.x.ai) |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/keys) |
 | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/apikey) |
+| `CLOUDFLARE_ACCOUNT_ID` | [dash.cloudflare.com](https://dash.cloudflare.com) — sidebar of any Workers & Pages page |
+| `CLOUDFLARE_API_TOKEN` | dash.cloudflare.com → My Profile → API Tokens → Create Token → "Workers AI" template |
 
 Optional overrides (defaults already sensible):
 `CHAT_MODEL`, `GEMINI_VISION_MODEL`, `GEMINI_IMAGE_MODEL`, `CHAT_BASE_URL`,
@@ -86,8 +89,10 @@ Optional overrides (defaults already sensible):
 ```bash
 pip install -r requirements.txt
 export TELEGRAM_BOT_TOKEN="..."
-export XAI_API_KEY="..."
+export GROQ_API_KEY="..."
 export GEMINI_API_KEY="..."
+export CLOUDFLARE_ACCOUNT_ID="..."
+export CLOUDFLARE_API_TOKEN="..."
 python hotbot_bot.py
 ```
 
