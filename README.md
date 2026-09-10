@@ -1,28 +1,66 @@
 # 🤖 AI Telegram Bot
 
-A Telegram bot for chat, vision, and image generation/editing — built on
-**official provider APIs only** (no third-party proxies, no shared keys).
+A Telegram bot for chat, voice, vision, PDF summarization, image
+generation/editing, and video generation — built on **official / documented
+provider APIs**.
 
 | Feature | Provider |
 |---|---|
-| 💬 Chat | [Groq](https://console.groq.com) |
+| 💬 Chat (multi-turn, memory) | [Groq](https://console.groq.com) |
+| 🎙️ Voice-in (speech → text) | Groq Whisper |
+| 🔊 Voice-out (text → speech) | Microsoft Edge TTS (`edge-tts`, free, no key) |
 | 👁️ Vision (ask about a photo) | [Google Gemini](https://ai.google.dev) |
-| 🖼️ Image generate / edit | [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai) (free tier, Stable Diffusion XL — real image-to-image editing) |
-| 🆓 Backup image generate | Community Cloudflare-Workers-based service (generation only) |
+| 📄 PDF summarization | Google Gemini |
+| 🖼️ Image generate | Cloudflare Workers AI (Stable Diffusion XL) |
+| ✏️ Image edit | Cloudflare Workers AI (Stable Diffusion v1.5 img2img — a **different**, edit-specific model, see note below) |
+| 🆓 Image generate backup #1 | Ashlynn community worker |
+| 🆓 Image generate backup #2 | "still-queen" community worker |
+| 🎬 Video generate | Video Studio community worker (best-effort) |
+| 🔍 Web search | TeCoxBeta |
 | 🧠 Memory | Local JSON, per-user, on/off toggle |
 
 ---
 
-## ✨ Features
+## 🛠️ What was fixed
 
-- `/start` — main menu with inline buttons (Chat / Image / Memory / Help)
-- `/ask <question>` — quick chat without opening the menu
-- `/img <prompt>` — quick image generation
-- Send a **photo** → bot asks whether you want it *analyzed* (vision) or
-  *edited* (image editing), then does it
-- `/memory` — view memory status, `/memory on` / `/memory off`
+**Image editing was failing while generation worked.** Both used to go
+through the same Cloudflare model (`stable-diffusion-xl-base-1.0`), whose
+img2img path is still "Beta" and prone to `500 InferenceResponse` errors.
+Editing now uses a **dedicated img2img model**
+(`@cf/runwayml/stable-diffusion-v1-5-img2img`), which is far more reliable
+for editing an existing photo. Generation still uses SDXL for best quality.
+If it still fails, the bot now surfaces Cloudflare's raw error text so it's
+easy to see exactly what's wrong.
+
+**Buttons occasionally not responding.** The old code mixed a
+`ConversationHandler` with separate global fallback handlers doing the same
+job — a known source of swallowed/duplicate updates in
+`python-telegram-bot`. It's been removed in favor of the simpler manual
+state tracking (`ctx.user_data["waiting_for"]`) the bot already used
+internally, which is what actually drove the logic anyway.
+
+---
+
+## ✨ Commands
+
+- `/start` — main menu with inline buttons
+- `/ask <question>` — quick chat
+- `/img <prompt>` — generate an image (Cloudflare)
+- `/img2 <prompt>` — generate an image (free backup #1)
+- `/img3 <prompt>` — generate an image (free backup #2)
+- `/video <prompt>` — generate a short video
+- `/search <question>` — live web search with sources
+- `/voice on` / `/voice off` — also get a voice reply on **text** chats
+  (voice messages you send always get a voice reply back)
+- `/memory` — view memory status; `/memory on` / `/memory off`
 - `/clear` — wipe your saved conversation history
 - `/cancel` — abort whatever the bot is currently waiting for
+- `/help` — full command list inside the bot
+
+**Send a photo** → bot asks whether you want it *analyzed* (vision) or
+*edited*, then does it. **Send a voice message** → bot transcribes it,
+replies in chat, and also sends a spoken reply. **Send a PDF** → bot
+replies with a Bengali summary.
 
 ---
 
@@ -32,6 +70,7 @@ A Telegram bot for chat, vision, and image generation/editing — built on
 .
 ├── hotbot_bot.py       # the entire bot
 ├── requirements.txt    # Python dependencies
+├── runtime.txt         # Python version for Render
 ├── .env.example        # names of the secrets you need (no real values)
 └── README.md
 ```
@@ -40,20 +79,17 @@ A Telegram bot for chat, vision, and image generation/editing — built on
 
 ## 🔑 Required secrets
 
-Set these as **environment variables** on your host (never commit real
-values to Git):
-
 | Variable | Where to get it |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | [@BotFather](https://t.me/BotFather) on Telegram |
-| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/keys) |
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/keys) — free |
 | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/apikey) |
 | `CLOUDFLARE_ACCOUNT_ID` | [dash.cloudflare.com](https://dash.cloudflare.com) — sidebar of any Workers & Pages page |
 | `CLOUDFLARE_API_TOKEN` | dash.cloudflare.com → My Profile → API Tokens → Create Token → "Workers AI" template |
 
-Optional overrides (defaults already sensible):
-`CHAT_MODEL`, `GEMINI_VISION_MODEL`, `GEMINI_IMAGE_MODEL`, `CHAT_BASE_URL`,
-`GEMINI_BASE_URL`, `MEMORY_MAX_MESSAGES`, `MEMORY_MAX_CHARS`.
+The backup image generators, video generator, web search, and voice-out
+(Edge TTS) need **no key at all** — see `.env.example` for their optional
+override variables.
 
 ---
 
@@ -61,15 +97,9 @@ Optional overrides (defaults already sensible):
 
 1. **New → Web Service** → connect this repo
 2. **Instance Type:** Free
-3. **Build Command:**
-   ```
-   pip install -r requirements.txt
-   ```
-4. **Start Command:**
-   ```
-   python hotbot_bot.py
-   ```
-5. Go to the **Environment** tab and add the three secrets above
+3. **Build Command:** `pip install -r requirements.txt`
+4. **Start Command:** `python hotbot_bot.py`
+5. Go to the **Environment** tab and add the five required secrets above
 6. Deploy, then check **Logs** for:
    ```
    health check server listening on 0.0.0.0:xxxx
@@ -78,9 +108,6 @@ Optional overrides (defaults already sensible):
 
 > Free-tier services sleep after 15 minutes of inactivity — the first
 > message after a quiet period may take 30–50 seconds to get a reply.
-> The bot includes a tiny built-in HTTP health-check endpoint purely so
-> Render recognizes it as a valid Web Service; Telegram updates are
-> still handled via long polling, not HTTP.
 
 ---
 
@@ -98,14 +125,27 @@ python hotbot_bot.py
 
 ---
 
-## 🔄 Swapping providers later
+## ⚠️ Known limitations (honest notes)
 
-All provider settings live in one place at the top of `hotbot_bot.py`:
-`CHAT_PROVIDER` and `GEMINI_PROVIDER`. To switch chat to a different
-OpenAI-compatible API, just change the `base_url` / `model` / API-key
-environment variable name there. Vision/image providers with a different
-request shape need a small edit inside `gemini_vision_answer` /
-`gemini_image_generate` — the rest of the bot is untouched.
+- **Video generation** (`/video`) talks to a small community "Video Studio"
+  Cloudflare Worker whose exact API contract isn't publicly documented —
+  the field names in `video_generate()` are inferred from its web UI. If it
+  ever breaks after the provider changes something, that one function is
+  the only place to fix, and errors include the provider's raw response
+  text to make debugging fast.
+- **Web search** (`/search`) similarly parses a few common response field
+  names defensively; if TeCoxBeta changes its response shape, adjust
+  `web_search()`.
+- **Voice replies** are sent as a normal audio file (`reply_audio`), not a
+  native round Telegram "voice bubble" (`reply_voice`) — a real voice bubble
+  requires OGG/Opus audio, which needs an `ffmpeg` conversion step. Skipping
+  that keeps the bot dependency-light and reliable on free hosting; the
+  audio still plays fine, just with a different-looking bubble.
+- **Image editing precision:** the Cloudflare img2img model can restyle a
+  whole photo (filters, art styles) or, with a mask, edit a specific region.
+  This bot currently only does whole-image img2img — "change only the
+  background, keep everything else" isn't pixel-precise the way Gemini's
+  Nano Banana was, but it doesn't hit Google's tiny free-tier quota either.
 
 ---
 
@@ -115,5 +155,4 @@ request shape need a small edit inside `gemini_vision_answer` /
 - `bot_memory.json` (created at runtime, holds per-user chat history) is
   git-ignored — don't commit it
 - If a token or key is ever accidentally committed, revoke/rotate it
-  immediately (BotFather `/revoke` for Telegram, provider dashboard for
-  API keys) and remove it from Git history
+  immediately and remove it from Git history
