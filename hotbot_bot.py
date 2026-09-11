@@ -111,10 +111,10 @@ CLOUDFLARE_PROVIDER = {
     "account_id": os.environ.get("CLOUDFLARE_ACCOUNT_ID", ""),
     "api_token": os.environ.get("CLOUDFLARE_API_TOKEN", ""),
     "generate_model": os.environ.get(
-        "CLOUDFLARE_IMAGE_MODEL", "@cf/stabilityai/stable-diffusion-xl-base-1.0"
+        "CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell"
     ),
     "edit_model": os.environ.get(
-        "CLOUDFLARE_EDIT_MODEL", "@cf/runwayml/stable-diffusion-v1-5-img2img"
+        "CLOUDFLARE_EDIT_MODEL", "@cf/black-forest-labs/flux-1-schnell"
     ),
 }
 
