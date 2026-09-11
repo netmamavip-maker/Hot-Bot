@@ -619,7 +619,7 @@ async def web_search(query: str, depth: str = "standard") -> str:
     body = {
         "query": query,
         "depth": depth,
-        "safe": True,
+        "safe": false,
         "max_output_tokens": 1200,
         "stream": False,
     }
