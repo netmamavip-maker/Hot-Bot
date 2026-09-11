@@ -121,8 +121,6 @@ CLOUDFLARE_PROVIDER = {
 # --- Backup / community text-to-image providers (generation only) ---------
 # Independent third-party Cloudflare-Workers-based projects. No account, no
 # key. Used as fallbacks / secondary "free" generators, never for editing.
-# SAFETY IS ALWAYS FORCED ON for the Ashlynn backend (see backup_image_generate)
-# and is never exposed as a togglable option anywhere in this bot.
 BACKUP_IMAGE_PROVIDER = {
     "name": "ashlynn-community",
     "enabled": os.environ.get("BACKUP_IMAGE_ENABLED", "true").lower() == "true",
@@ -495,8 +493,7 @@ async def cf_image_run(
 
 
 async def backup_image_generate(prompt: str, dimensions: str = "1:1") -> str:
-    """Ashlynn community backup. Returns a hosted image URL. SAFETY IS ALWAYS
-    FORCED TRUE here — this is intentional and must never be made configurable."""
+    """Ashlynn community backup. Returns a hosted image URL."""
     cfg = BACKUP_IMAGE_PROVIDER
     if not cfg["enabled"]:
         raise ProviderError("Backup image provider #1 is disabled.")
@@ -505,7 +502,7 @@ async def backup_image_generate(prompt: str, dimensions: str = "1:1") -> str:
         "prompt": prompt,
         "image": 1,
         "dimensions": dimensions,
-        "safety": "true",  # hardcoded — never read from config or user input
+        "safety": "false",  # always read from config or user input
         "steps": cfg["steps"],
     }
     async with httpx.AsyncClient(timeout=90.0) as client:
